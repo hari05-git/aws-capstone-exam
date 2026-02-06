@@ -1,130 +1,96 @@
-########################################
-# Data: Get 2 Availability Zones + AMI
-########################################
-data "aws_availability_zones" "available" {
-  state = "available"
+############################################
+# Provider + Variables (single-file style)
+############################################
+terraform {
+  required_version = ">= 1.5.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
 }
 
-data "aws_ami" "amazon_linux2" {
-  most_recent = true
-  owners      = ["amazon"]
+provider "aws" {
+  region = "us-east-1"
+}
 
+# Choose two AZs
+variable "azs" {
+  type    = list(string)
+  default = ["us-east-1a", "us-east-1b"]
+}
+
+# Your Ubuntu AMI (us-east-1)
+variable "ubuntu_ami" {
+  type    = string
+  default = "ami-0b6c6ebed2801a5cb"
+}
+
+# Where your SSH public key is located locally
+variable "ssh_public_key_path" {
+  type    = string
+  default = "~/.ssh/streamline-key.pub"
+}
+
+############################################
+# Use default VPC + select default public subnets
+############################################
+data "aws_vpc" "default" {
+  default = true
+}
+
+# Default-for-az subnets are the AWS-created public subnets
+data "aws_subnets" "default_public" {
   filter {
-    name   = "name"
-    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+  filter {
+    name   = "default-for-az"
+    values = ["true"]
   }
 }
 
+# Pick two public subnets
 locals {
-  azs = slice(data.aws_availability_zones.available.names, 0, 2)
+  selected_public_subnet_ids = slice(data.aws_subnets.default_public.ids, 0, 2)
 }
 
-########################################
-# Network Topology
-########################################
+############################################
+# Two NEW private subnets for RDS (no internet)
+############################################
+resource "aws_subnet" "private" {
+  count                   = 2
+  vpc_id                  = data.aws_vpc.default.id
+  # Carve subnets from the VPC CIDR (adds 8 bits, indexes start at 100 to avoid overlap)
+  cidr_block              = cidrsubnet(data.aws_vpc.default.cidr_block, 8, count.index + 100)
+  availability_zone       = var.azs[count.index]
+  map_public_ip_on_launch = false
 
-# VPC: 10.0.0.0/16
-resource "aws_vpc" "task_vpc" {
-  cidr_block           = "10.0.0.0/16"
-  enable_dns_support   = true
-  enable_dns_hostnames = true
-
-  tags = { Name = "task-vpc" }
-}
-
-# Public Subnet 1: 10.0.1.0/24 in AZ1
-resource "aws_subnet" "public_1" {
-  vpc_id                  = aws_vpc.task_vpc.id
-  cidr_block              = "10.0.1.0/24"
-  availability_zone       = local.azs[0]
-  map_public_ip_on_launch = true
-
-  tags = { Name = "public-subnet-1" }
-}
-
-# Public Subnet 2: 10.0.2.0/24 in AZ2
-resource "aws_subnet" "public_2" {
-  vpc_id                  = aws_vpc.task_vpc.id
-  cidr_block              = "10.0.2.0/24"
-  availability_zone       = local.azs[1]
-  map_public_ip_on_launch = true
-
-  tags = { Name = "public-subnet-2" }
-}
-
-# Private Subnet 1: 10.0.3.0/24 in AZ1
-resource "aws_subnet" "private_1" {
-  vpc_id            = aws_vpc.task_vpc.id
-  cidr_block        = "10.0.3.0/24"
-  availability_zone = local.azs[0]
-
-  tags = { Name = "private-subnet-1" }
-}
-
-# Private Subnet 2: 10.0.4.0/24 in AZ2
-resource "aws_subnet" "private_2" {
-  vpc_id            = aws_vpc.task_vpc.id
-  cidr_block        = "10.0.4.0/24"
-  availability_zone = local.azs[1]
-
-  tags = { Name = "private-subnet-2" }
-}
-
-# Internet Gateway
-resource "aws_internet_gateway" "task_igw" {
-  vpc_id = aws_vpc.task_vpc.id
-  tags   = { Name = "task-igw" }
-}
-
-# Public Route Table with 0.0.0.0/0 -> IGW
-resource "aws_route_table" "public_rt" {
-  vpc_id = aws_vpc.task_vpc.id
-
-  route {
-    cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.task_igw.id
+  tags = {
+    Name = "streamline-private-${count.index + 1}"
   }
-
-  tags = { Name = "public-rt" }
 }
 
-# Associate Public RT to both public subnets
-resource "aws_route_table_association" "public_1_assoc" {
-  subnet_id      = aws_subnet.public_1.id
-  route_table_id = aws_route_table.public_rt.id
-}
-
-resource "aws_route_table_association" "public_2_assoc" {
-  subnet_id      = aws_subnet.public_2.id
-  route_table_id = aws_route_table.public_rt.id
-}
-
-# Private Route Table (NO direct internet)
 resource "aws_route_table" "private_rt" {
-  vpc_id = aws_vpc.task_vpc.id
-  tags   = { Name = "private-rt" }
+  vpc_id = data.aws_vpc.default.id
+  tags = { Name = "streamline-private-rt" }
 }
 
-# Associate Private RT to both private subnets
-resource "aws_route_table_association" "private_1_assoc" {
-  subnet_id      = aws_subnet.private_1.id
+resource "aws_route_table_association" "private_assoc" {
+  count          = 2
+  subnet_id      = aws_subnet.private[count.index].id
   route_table_id = aws_route_table.private_rt.id
 }
 
-resource "aws_route_table_association" "private_2_assoc" {
-  subnet_id      = aws_subnet.private_2.id
-  route_table_id = aws_route_table.private_rt.id
-}
-
-########################################
+############################################
 # Security Groups
-########################################
-
-# Web SG: HTTP 80 from anywhere + SSH 22 from your IP
+############################################
 resource "aws_security_group" "web_sg" {
-  name        = "web-sg"
-  description = "Web SG: HTTP from anywhere, SSH from my IP"
-  vpc_id      = aws_vpc.task_vpc.id
+  name        = "streamline-web-sg"
+  description = "Allow HTTP from anywhere and SSH from my IP"
+  vpc_id      = data.aws_vpc.default.id
 
   ingress {
     description = "HTTP"
@@ -134,58 +100,31 @@ resource "aws_security_group" "web_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  ingress {
-    description = "SSH"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = [var.my_ip_cidr]
-  }
+ ingress {
+   description = "SSH from anywhere"
+   from_port   = 22
+   to_port     = 22
+   protocol    = "tcp"
+   cidr_blocks = ["0.0.0.0/0"]
+}
 
   egress {
-    description = "All outbound"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  tags = { Name = "web-sg" }
+  tags = { Name = "streamline-web-sg" }
 }
 
-# ALB SG: HTTP 80 from anywhere
-resource "aws_security_group" "alb_sg" {
-  name        = "alb-sg"
-  description = "ALB SG: Allow HTTP from anywhere"
-  vpc_id      = aws_vpc.task_vpc.id
+resource "aws_security_group" "db_sg" {
+  name        = "streamline-db-sg"
+  description = "Allow MySQL from web SG only"
+  vpc_id      = data.aws_vpc.default.id
 
   ingress {
-    description = "HTTP"
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  egress {
-    description = "All outbound"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = { Name = "alb-sg" }
-}
-
-# RDS SG: MySQL 3306 ONLY from Web SG
-resource "aws_security_group" "rds_sg" {
-  name        = "rds-sg"
-  description = "RDS SG: Allow MySQL only from web-sg"
-  vpc_id      = aws_vpc.task_vpc.id
-
-  ingress {
-    description     = "MySQL from web-sg"
+    description     = "MySQL"
     from_port       = 3306
     to_port         = 3306
     protocol        = "tcp"
@@ -193,140 +132,116 @@ resource "aws_security_group" "rds_sg" {
   }
 
   egress {
-    description = "All outbound"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  tags = { Name = "rds-sg" }
+  tags = { Name = "streamline-db-sg" }
 }
 
-########################################
-# Compute: 2 EC2 Instances in Public Subnets
-########################################
-resource "aws_instance" "web_1" {
-  ami                    = data.aws_ami.amazon_linux2.id
-  instance_type          = var.instance_type
-  subnet_id              = aws_subnet.public_1.id
-  vpc_security_group_ids = [aws_security_group.web_sg.id]
-  key_name               = var.key_name
 
-  user_data = <<-EOF
-    #!/bin/bash
-    yum update -y
-    yum install -y httpd
-    systemctl enable httpd
-    echo "<h1>Web Server 1</h1>" > /var/www/html/index.html
-    systemctl start httpd
-  EOF
-
-  tags = { Name = "web-server-1" }
+############################################
+# RDS: Subnet group + MySQL instance
+############################################
+resource "aws_db_subnet_group" "db_subnets" {
+  name       = "streamline-db-subnet-group"
+  subnet_ids = aws_subnet.private[*].id
+  tags       = { Name = "streamline-db-subnet-group" }
 }
 
-resource "aws_instance" "web_2" {
-  ami                    = data.aws_ami.amazon_linux2.id
-  instance_type          = var.instance_type
-  subnet_id              = aws_subnet.public_2.id
-  vpc_security_group_ids = [aws_security_group.web_sg.id]
-  key_name               = var.key_name
-
-  user_data = <<-EOF
-    #!/bin/bash
-    yum update -y
-    yum install -y httpd
-    systemctl enable httpd
-    echo "<h1>Web Server 2</h1>" > /var/www/html/index.html
-    systemctl start httpd
-  EOF
-
-  tags = { Name = "web-server-2" }
+resource "aws_db_instance" "mysql" {
+  identifier              = "streamline-db"
+  allocated_storage       = 20
+  engine                  = "mysql"
+  engine_version          = "8.0"
+  instance_class          = "db.t3.micro"
+  username                = "admin"
+  password                = "Password123!"   # For demo only. Rotate in real env.
+  db_subnet_group_name    = aws_db_subnet_group.db_subnets.name
+  vpc_security_group_ids  = [aws_security_group.db_sg.id]
+  skip_final_snapshot     = true
+  publicly_accessible     = false
+  multi_az                = false
+  deletion_protection     = false
+  # Storage type defaults are fine for free-tier
+  tags = { Name = "streamline-rds" }
 }
 
-########################################
-# Load Balancer: ALB in Public Subnets (Port 80)
-########################################
-resource "aws_lb" "task_alb" {
-  name               = "task-alb"
-  load_balancer_type = "application"
+resource "aws_instance" "web" {
+  count                       = 2
+  ami                         = var.ubuntu_ami
+  instance_type               = "t3.micro"
+  subnet_id                   = local.selected_public_subnet_ids[count.index]
+  vpc_security_group_ids      = [aws_security_group.web_sg.id]
+  associate_public_ip_address = true
+
+  key_name = "02-06-2026-Nvirginia"   # ← use your existing AWS key pair name
+
+  tags = {
+    Name = "streamline-web-${count.index + 1}"
+  }
+}
+
+############################################
+# ALB + TG + Listener
+############################################
+resource "aws_lb" "app_lb" {
+  name               = "streamline-alb"
   internal           = false
-  security_groups    = [aws_security_group.alb_sg.id]
-  subnets            = [aws_subnet.public_1.id, aws_subnet.public_2.id]
-
-  tags = { Name = "task-alb" }
+  load_balancer_type = "application"
+  subnets            = local.selected_public_subnet_ids
+  tags               = { Name = "streamline-alb" }
 }
 
-resource "aws_lb_target_group" "task_tg" {
-  name     = "task-tg"
+resource "aws_lb_target_group" "tg" {
+  name     = "streamline-tg"
   port     = 80
   protocol = "HTTP"
-  vpc_id   = aws_vpc.task_vpc.id
+  vpc_id   = data.aws_vpc.default.id
 
   health_check {
     path                = "/"
-    protocol            = "HTTP"
-    matcher             = "200-399"
-    interval            = 30
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
     timeout             = 5
-    healthy_threshold   = 3
-    unhealthy_threshold = 3
+    interval            = 30
+    matcher             = "200-399"
   }
 
-  tags = { Name = "task-tg" }
+  tags = { Name = "streamline-tg" }
 }
 
-resource "aws_lb_target_group_attachment" "attach_web1" {
-  target_group_arn = aws_lb_target_group.task_tg.arn
-  target_id        = aws_instance.web_1.id
+resource "aws_lb_target_group_attachment" "attach" {
+  count            = 2
+  target_group_arn = aws_lb_target_group.tg.arn
+  target_id        = aws_instance.web[count.index].id
   port             = 80
 }
 
-resource "aws_lb_target_group_attachment" "attach_web2" {
-  target_group_arn = aws_lb_target_group.task_tg.arn
-  target_id        = aws_instance.web_2.id
-  port             = 80
-}
-
-resource "aws_lb_listener" "http_80" {
-  load_balancer_arn = aws_lb.task_alb.arn
+resource "aws_lb_listener" "listener" {
+  load_balancer_arn = aws_lb.app_lb.arn
   port              = 80
   protocol          = "HTTP"
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.task_tg.arn
+    target_group_arn = aws_lb_target_group.tg.arn
   }
 }
 
-########################################
-# Database Layer: RDS MySQL in Private Subnets
-########################################
-
-# DB Subnet Group using two private subnets
-resource "aws_db_subnet_group" "db_subnet_group" {
-  name       = "db-subnet-group"
-  subnet_ids = [aws_subnet.private_1.id, aws_subnet.private_2.id]
-
-  tags = { Name = "db-subnet-group" }
+############################################
+# Outputs
+############################################
+output "alb_dns_name" {
+  value = aws_lb.app_lb.dns_name
 }
 
-# RDS MySQL instance (Free tier type: db.t3.micro)
-resource "aws_db_instance" "mysql" {
-  identifier             = "task-mysql"
-  engine                 = "mysql"
-  engine_version         = "8.0"
-  instance_class         = "db.t3.micro"
-  allocated_storage      = 20
+output "web_public_ips" {
+  value = aws_instance.web[*].public_ip
+}
 
-  db_name                = var.db_name
-  username               = var.db_username
-  password               = var.db_password
-
-  db_subnet_group_name   = aws_db_subnet_group.db_subnet_group.name
-  vpc_security_group_ids = [aws_security_group.rds_sg.id]
-
-  publicly_accessible    = false
-  skip_final_snapshot    = true
-  deletion_protection    = false
+output "rds_endpoint" {
+  value = aws_db_instance.mysql.address
 }
